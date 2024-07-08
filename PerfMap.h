@@ -34,9 +34,9 @@ public:
 
     void process(const std::function<void(const SampleData&)>& handle, const bool* loop = nullptr);
 
-    int disable();
+    void disable();
 
-    int enable();
+    void enable();
 
     void destroy();
 };

@@ -151,6 +151,19 @@ void PerfMap::process(const std::function<void(const SampleData&)>& handle, cons
     }
 }
 
+void PerfMap::enable() {
+    for (auto& info : _perf_infos) {
+        ioctl(info.fd, PERF_EVENT_IOC_ENABLE, 0);
+    }
+}
+
+void PerfMap::disable() {
+    for (auto& info : _perf_infos) {
+        ioctl(info.fd, PERF_EVENT_IOC_RESET, 0);
+        ioctl(info.fd, PERF_EVENT_IOC_DISABLE, 0);
+    }
+}
+
 void PerfMap::destroy() {
     if (_leader_info.fd) {
         ioctl(_leader_info.fd, PERF_EVENT_IOC_DISABLE, isSingle ? 0 : PERF_IOC_FLAG_GROUP);
