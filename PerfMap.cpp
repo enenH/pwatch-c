@@ -3,11 +3,11 @@
 #include <cstdio>
 #include <iostream>
 #include <poll.h>
-#include <unistd.h>
 #include <asm-generic/unistd.h>
 #include <bits/ioctl.h>
 #include <linux/perf_event.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 static int perf_event_open(struct perf_event_attr* evt_attr, pid_t pid,
                            int cpu, int group_fd, unsigned long flags) {
@@ -17,7 +17,6 @@ static int perf_event_open(struct perf_event_attr* evt_attr, pid_t pid,
 }
 
 int PerfMap::create(const std::vector<int>& pids, uintptr_t bp_addr, int bp_type, size_t bp_len, int buf_size) {
-
     perf_event_attr attr{};
     attr.size = sizeof(attr);
     attr.type = PERF_TYPE_BREAKPOINT;
@@ -40,112 +39,97 @@ int PerfMap::create(const std::vector<int>& pids, uintptr_t bp_addr, int bp_type
     attr.mmap = 1;
     attr.comm = 1;
     attr.mmap_data = 1;
+    attr.mmap2 = 1;
 
-
-    int leader_fd = perf_event_open(&attr, pids[0], -1, -1, PERF_FLAG_FD_CLOEXEC);
-    if (leader_fd < 0) {
-        perror("leader_fd perf_event_open error");
-        return -1;
-    }
-
-    printf( "leader_fd = %d\n", leader_fd);
-    for (int i = 1; i < pids.size(); i++) {
-        auto pid = pids[i];
+    for (int pid : pids) {
         PerfInfo info{};
-        int fd = perf_event_open(&attr, pid, -1, -1, 0);
+        int fd = perf_event_open(&attr, pid, -1, -1, PERF_FLAG_FD_CLOEXEC);
         if (fd < 0) {
-            perror("perf_event_open error");
+            printf("%d perf_event_open error %s\n", pid, strerror(errno));
             continue;
         }
+        ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+        ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
 
-        errno = 0;
-
-        ioctl(leader_fd, PERF_EVENT_IOC_RESET,0);
-        perror( "PERF_EVENT_IOC_SET_OUTPUT 11");
-        ioctl(fd, PERF_EVENT_IOC_SET_OUTPUT, leader_fd);
-        perror( "PERF_EVENT_IOC_SET_OUTPUT");
-        info.pid = pid;
         info.fd = fd;
-        info.mmap_size = 0;
-        info.mmap_addr = nullptr;
+        info.mmap_size = (1 + (1 << buf_size)) * PAGE_SIZE;
+        info.mmap_addr = mmap(nullptr, info.mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (info.mmap_addr == MAP_FAILED) {
+            printf("%d mmap error %s\n", pid, strerror(errno));
+            close(fd);
+            continue;
+        }
         _perf_infos.push_back(info);
     }
-
-    size_t mmap_size = (1 + (1 << buf_size)) * PAGE_SIZE;
-    void* mmap_addr = mmap(nullptr, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, leader_fd, 0);
-    if (mmap_addr == MAP_FAILED) {
-        perror("mmap error");
-        close(leader_fd);
-        return -1;
-    }
-
-    _leader_info.pid = pids[0];
-    _leader_info.fd = leader_fd;
-    _leader_info.mmap_addr = mmap_addr;
-    _leader_info.mmap_size = mmap_size;
-    isSingle = pids.size() == 1;
-
-    /*ioctl(leader_fd, PERF_EVENT_IOC_RESET, isSingle ? 0 : PERF_IOC_FLAG_GROUP);
-    ioctl(leader_fd, PERF_EVENT_IOC_ENABLE, isSingle ? 0 : PERF_IOC_FLAG_GROUP);*/
     return 0;
 }
 
 void PerfMap::process(const std::function<void(const SampleData&)>& handle, const bool* loop) {
-    pollfd perf_poll{};
+    if (_perf_infos.empty()) {
+        printf("No perf event to process\n");
+        return;
+    }
+    pollfd perf_poll[_perf_infos.size()];
 
-    auto& info = _leader_info;
-    info.mmap_page_metadata = (perf_event_mmap_page*)info.mmap_addr;
-    info.data_addr = (uintptr_t)info.mmap_addr + info.mmap_page_metadata->data_offset;
-    info.read_data_size = 0;
-    info.data_size = info.mmap_page_metadata->data_size;
-    perf_poll.fd = info.fd;
-    perf_poll.events = POLLIN;
+    for (int i = 0; i < _perf_infos.size(); i++) {
+        auto& info = _perf_infos[i];
+        info.mmap_page_metadata = (perf_event_mmap_page*)info.mmap_addr;
+        info.data_addr = (uintptr_t)info.mmap_addr + info.mmap_page_metadata->data_offset;
+        info.read_data_size = 0;
+        info.data_size = info.mmap_page_metadata->data_size;
+        perf_poll[i].fd = info.fd;
+        perf_poll[i].events = POLLIN;
+    }
 
     while (loop == nullptr || *loop) {
         //每两秒退出一下 防止卡死
-        int ret = poll(&perf_poll, 1, 2000);
+        int ret = poll(perf_poll, _perf_infos.size(), 2000);
         if (ret <= 0) {
             continue;
         }
-        if (perf_poll.revents & POLLIN) {
-            while (info.mmap_page_metadata->data_head != info.read_data_size) {
-                auto get_addr = [&](size_t offset) {
-                    return info.data_addr + ((info.read_data_size + offset) % info.data_size);
-                };
-                auto data_header = (perf_event_header*)get_addr(0);
-                auto offset = sizeof(perf_event_header);
-                if (data_header->type == PERF_RECORD_SAMPLE) {
-                    auto pid = *(uint32_t*)get_addr(offset);
-                    offset += sizeof(uint32_t);
-                    auto tid = *(uint32_t*)get_addr(offset);
-                    offset += sizeof(uint32_t);
-                    auto abi = *(uint64_t*)get_addr(offset);
-                    offset += sizeof(uint64_t);
+        for (int i = 0; i < _perf_infos.size(); i++) {
+            auto& info = _perf_infos[i];
+            if (perf_poll[i].revents & POLLIN) {
+                while (info.mmap_page_metadata->data_head != info.read_data_size) {
+                    auto get_addr = [&](size_t offset) {
+                        return info.data_addr + ((info.read_data_size + offset) % info.data_size);
+                    };
+                    auto data_header = (perf_event_header*)get_addr(0);
+                    auto offset = sizeof(perf_event_header);
+                    if (data_header->type == PERF_RECORD_SAMPLE) {
+                        auto pid = *(uint32_t*)get_addr(offset);
+                        offset += 4;
+                        auto tid = *(uint32_t*)get_addr(offset);
+                        offset += 4;
+                        auto abi = *(uint64_t*)get_addr(offset);
+                        offset += 8;
 
-                    SampleData data{};
-                    memcpy(data.regs, (void*)get_addr(offset), sizeof(data.regs));
-                    offset += sizeof(data.regs);
-
-                    data.pid = pid;
-                    data.tid = tid;
-                    data.abi = abi;
-                    handle(data);
-                    if (loop != nullptr && *loop == false) {
-                        return;
+                        SampleData data{};
+                        for (unsigned long& reg : data.regs) {
+                            reg = *(uint64_t*)get_addr(offset);
+                            offset += 8;
+                        }
+                        data.pid = pid;
+                        data.tid = tid;
+                        data.abi = abi;
+                        handle(data);
+                        if (loop != nullptr && *loop == false) {
+                            return;
+                        }
                     }
-                }
 #ifndef NDEBUG
-                else if (data_header->type == PERF_RECORD_LOST) {
-                    auto lost = *(uint64_t*)get_addr(offset);
-                    std::cout << "-------" << std::endl;
-                    std::cout << "Lost " << lost << " events" << std::endl;
-                } else {
-                    std::cout << "-------" << std::endl;
-                    std::cout << "Unknown type" << std::endl;
-                }
+                    else if (data_header->type == PERF_RECORD_LOST) {
+                        auto lost = *(uint64_t*)get_addr(offset);
+                        std::cout << "-------" << std::endl;
+                        std::cout << "Lost " << lost << " events" << std::endl;
+                    } else {
+                        std::cout << "-------" << std::endl;
+                        std::cout << "Unknown type" << std::endl;
+                    }
 #endif
-                info.read_data_size += data_header->size;
-                info.mmap_page_metadata->data_tail = info.read_data_size;
+                    info.read_data_size += data_header->size;
+                    info.mmap_page_metadata->data_tail = info.read_data_size;
+                }
             }
         }
     }
@@ -165,21 +149,13 @@ void PerfMap::disable() {
 }
 
 void PerfMap::destroy() {
-    if (_leader_info.fd) {
-        ioctl(_leader_info.fd, PERF_EVENT_IOC_DISABLE, isSingle ? 0 : PERF_IOC_FLAG_GROUP);
-        close(_leader_info.fd);
-    }
-    if (_leader_info.mmap_addr)
-        munmap(_leader_info.mmap_addr, _leader_info.mmap_size);
-
-    if (!isSingle) {
-        for (auto& info : _perf_infos) {
-            if (info.fd) {
-                close(info.fd);
-            }
-            if (info.mmap_addr) {
-                munmap(info.mmap_addr, info.mmap_size);
-            }
+    for (auto& info : _perf_infos) {
+        if (info.fd) {
+            ioctl(info.fd, PERF_EVENT_IOC_DISABLE, 0);
+            close(info.fd);
+        }
+        if (info.mmap_addr) {
+            munmap(info.mmap_addr, info.mmap_size);
         }
     }
     _perf_infos.clear();

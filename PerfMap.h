@@ -4,7 +4,6 @@
 #include <asm/perf_regs.h>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
-
 struct SampleData {
     uint32_t pid;
     uint32_t tid;
@@ -25,8 +24,6 @@ class PerfMap {
         int read_data_size = 0;
     };
 
-    bool isSingle = false;
-    PerfInfo _leader_info;
     std::vector<PerfInfo> _perf_infos;
 
 public:
@@ -34,9 +31,9 @@ public:
 
     void process(const std::function<void(const SampleData&)>& handle, const bool* loop = nullptr);
 
-    void disable();
-
     void enable();
+
+    void disable();
 
     void destroy();
 };
